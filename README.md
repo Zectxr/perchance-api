@@ -1,14 +1,13 @@
-# perchance
-[![pypi](https://img.shields.io/pypi/v/perchance)](https://pypi.org/project/perchance)
+# perchance-api
+[![pypi](https://img.shields.io/pypi/v/perchance-api)](https://pypi.org/project/perchance-api)
 [![python](https://img.shields.io/badge/python-3.11-blue)](https://www.python.org/downloads)
-[![BuyMeACoffee](https://img.shields.io/badge/support-yellow)](https://www.buymeacoffee.com/eeemoon)
 
 Unofficial Python API for [Perchance](https://perchance.org).
 
 ## Installation
 To install this module, run the following command:
 ```
-pip install perchance
+pip install perchance-api
 ```
 
 ## Examples
