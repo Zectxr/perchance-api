@@ -26,6 +26,10 @@ async def main():
 asyncio.run(main())
 ```
 
+> The text generator drives the official Perchance embed in a browser so its
+> anti-bot verification can complete. A browser window opens by default; pass
+> `TextGenerator(headless=True)` to hide it (verification may then fail).
+
 ### Image generation
 ```python
 import asyncio
@@ -43,3 +47,9 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Credits
+Originally created by [eeemoonYurii](https://github.com/eeemoon) as the
+[`perchance`](https://github.com/eeemoon/perchance) package. This fork
+(`perchance-api`) rewrites the API calls and adds the describe/streaming
+updates.
