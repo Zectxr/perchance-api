@@ -1,26 +1,57 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import random
+import uuid
 from typing import AsyncGenerator
 
+from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
+
 from . import errors
-from .generator import Generator
+
+EMBED_URL = "https://text-generation.perchance.org/embed"
+
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 
-class TextGenerator(Generator):
-    """AI text generator"""
+class TextGenerator:
+    """AI text generator.
 
-    BASE_URL = "https://text-generation.perchance.org/api"
+    Drives the official Perchance embed in a browser so its built-in
+    Cloudflare verification is handled automatically.
+    """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, headless: bool = False) -> None:
+        self._headless = headless
+        self._pw: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
 
         self._lock: asyncio.Lock = asyncio.Lock()
 
     def is_running(self) -> bool:
         return self._lock.locked()
+
+    async def __aenter__(self) -> TextGenerator:
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the generator and release resources."""
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._pw:
+            await self._pw.stop()
+        self._pw = self._browser = self._context = None
+
+    async def _start(self) -> None:
+        if not self._pw:
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(headless=self._headless)
+            self._context = await self._browser.new_context(user_agent=_USER_AGENT)
 
     async def stream(
         self,
@@ -28,7 +59,7 @@ class TextGenerator(Generator):
         *,
         start_with: str | None = None,
         stop_sequences: list[str] | None = None,
-        timeout: float | None = 5.0,
+        timeout: float = 60.0,
     ) -> AsyncGenerator[str, None]:
         """Stream generated text.
 
@@ -41,86 +72,72 @@ class TextGenerator(Generator):
         stop_sequences: list[str] | None
             List of sequences to stop the generation at.
         timeout: float | None
-            Waiting timeout in seconds.
+            Maximum time to wait for the next chunk in seconds.
         """
         async with self._lock:
             await self._start()
 
+            request_id = uuid.uuid4().hex
+            messages: asyncio.Queue = asyncio.Queue()
+
             async with await self._context.new_page() as page:
-                await page.goto(
-                    f"{self.BASE_URL}/verifyUser"
-                    f"?thread=0"
-                    f"&__cacheBust={random.random()}"
+                await page.expose_function(
+                    "_pc_on_message", lambda msg: messages.put_nowait(msg)
                 )
-
-                content = await page.content()
-                key_entry = content.find('"userKey":"')
-                start_index = key_entry + len('"userKey":"')
-                end_index = content.find('"', start_index)
-
-                if key_entry == -1 or end_index == -1:
-                    if "too_many_requests" in content:
-                        raise errors.RateLimitError("Rate limit exceeded")
-                    else:
-                        raise errors.AuthenticationError("Failed to retrieve user key")
-
-                key = content[start_index:end_index]
-
-                url = (
-                    f"{self.BASE_URL}/generate"
-                    f"?userKey={key}"
-                    f"&requestId=aiTextCompletion{random.randint(0, 2**30)}"
-                    f"&__cacheBust={random.random()}"
-                )
-                body = {
-                    "generatorName": "ai-text-generator",
-                    "instruction": prompt,
-                    "instructionTokenCount": 1,
-                    "startWith": start_with or "",
-                    "startWithTokenCount": 1,
-                    "stopSequences": stop_sequences or [],
-                }
-
-                queue: asyncio.Queue[str] = asyncio.Queue()
-
-                await page.expose_function("onChunk", queue.put)
-
-                fetch_task = asyncio.create_task(page.evaluate("""
-                    async ({ url, body }) => {
-                        const controller = new AbortController();
-                        window.abortFetch = () => controller.abort();
-
-                        const response = await fetch(url, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(body),
-                            signal: controller.signal
+                await page.add_init_script("""
+                    window.addEventListener("message", (event) => {
+                        window._pc_on_message({
+                            type: event.data.type,
+                            value: event.data.value,
+                            requestId: event.data.requestId,
+                            status: event.data.status,
                         });
+                    });
+                """)
+                await page.goto(EMBED_URL, wait_until="domcontentloaded")
 
-                        const reader = response.body.getReader();
-                        const decoder = new TextDecoder();
+                async def send(data: dict) -> None:
+                    await page.evaluate(
+                        "data => window.postMessage(data, '*')", data
+                    )
 
-                        while (true) {
-                            const { value, done } = await reader.read();
-                            if (done) break;
-                            const chunk = decoder.decode(value, { stream: true });
-                            await window.onChunk(chunk);
-                        }
-                    }
-                """, {"url": url, "body": body}))
+                await _wait_for(messages, "embedIsReady", timeout)
+                await send({"type": "verifyUser"})
+                try:
+                    await _wait_for(messages, "verified", timeout)
+                except asyncio.TimeoutError as error:
+                    raise errors.AuthenticationError(
+                        "Anti-bot verification did not complete in time."
+                    ) from error
+                await send({
+                    "type": "startStream",
+                    "requestId": request_id,
+                    "postData": {
+                        "instruction": prompt,
+                        "startWith": start_with or "",
+                        "stopSequences": stop_sequences or [],
+                    },
+                })
 
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(queue.get(), timeout=timeout)
-                        for line in chunk.splitlines():
-                            if line.startswith("t:"):
-                                yield json.loads(line[2:])
-                            elif line.startswith("data:"):
-                                return
-                    except asyncio.TimeoutError:
-                        await page.evaluate("window.abortFetch()")
-                        fetch_task.cancel()
-                        raise errors.ConnectionError()
+                keepalive = asyncio.create_task(_keepalive(page, request_id))
+                try:
+                    while True:
+                        message = await _wait_for_chunk(messages, timeout)
+                        kind = message["type"]
+
+                        if kind == "streamError":
+                            raise errors.ConnectionError(
+                                f"Failed to generate text: {message.get('status')}"
+                            )
+                        if kind == "streamEnd":
+                            return
+                        if kind == "streamData":
+                            value = message.get("value") or {}
+                            if value.get("text"):
+                                yield value["text"]
+                finally:
+                    keepalive.cancel()
+                    await send({"type": "stopStream", "requestId": request_id})
 
     async def text(
         self,
@@ -128,7 +145,7 @@ class TextGenerator(Generator):
         *,
         start_with: str | None = None,
         stop_sequences: list[str] | None = None,
-        timeout: float | None = 5.0,
+        timeout: float = 60.0,
     ) -> str:
         """Generate text.
 
@@ -141,7 +158,7 @@ class TextGenerator(Generator):
         stop_sequences: list[str] | None
             List of sequences to stop the generation at.
         timeout: float | None
-            Waiting timeout in seconds.
+            Maximum time to wait for the next chunk in seconds.
         """
         result = []
         async for chunk in self.stream(
@@ -153,3 +170,31 @@ class TextGenerator(Generator):
             result.append(chunk)
 
         return "".join(result)
+
+
+async def _keepalive(page, request_id: str) -> None:
+    while True:
+        await asyncio.sleep(5)
+        await page.evaluate(
+            "data => window.postMessage(data, '*')",
+            {"type": "streamKeepAlive", "requestId": request_id},
+        )
+
+
+async def _pump(messages, predicate, timeout: float):
+    while True:
+        message = await asyncio.wait_for(messages.get(), timeout=timeout)
+        if predicate(message):
+            return message
+
+
+async def _wait_for(messages, type: str, timeout: float) -> dict:
+    return await _pump(messages, lambda m: m["type"] == type, timeout)
+
+
+async def _wait_for_chunk(messages, timeout: float) -> dict:
+    return await _pump(
+        messages,
+        lambda m: m["type"] in ("streamData", "streamEnd", "streamError"),
+        timeout,
+    )
