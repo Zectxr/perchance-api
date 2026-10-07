@@ -1,0 +1,18 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "perchance"
+version = "0.2.0"
+homepage = "https://github.com/Zectxr/perchance-api"
+description = "Unofficial Python API for Perchance."
+authors = ["EeeMoon"]
+license = "MIT"
+readme = "README.md"
+include = ["pyproject.toml", "LICENSE"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+aiofiles = "^25.1.0"
+playwright = "^1.57.0"
